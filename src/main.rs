@@ -135,6 +135,9 @@ fn main() -> Result<()> {
                 avg_ms,
                 1000.0 / avg_ms
             );
+            if let Backend::Wgpu(ref r) = backend {
+                r.profile_stages(&model, &nchw);
+            }
         }
     }
 

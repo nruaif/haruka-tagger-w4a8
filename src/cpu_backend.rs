@@ -310,67 +310,71 @@ fn forward_block(x: &mut [f32], seq_len: usize, blk: &Eva02Block, model: &Haruka
 pub fn forward_pool(x_final: &[f32], seq_len: usize, pool: &MHAttnPoolParams, dim: usize) -> Vec<f32> {
     let x_norm = layer_norm(x_final, &pool.norm, seq_len);
     let kv = w4a8_linear(&x_norm, seq_len, &pool.kv);
+    forward_pool_from_kv(&kv, seq_len, pool, dim)
+}
+
+pub fn forward_pool_from_kv(kv: &[f32], seq_len: usize, pool: &MHAttnPoolParams, dim: usize) -> Vec<f32> {
     let nh = pool.num_heads;
     let hd = pool.head_dim;
     let scale = 1.0f32 / (hd as f32).sqrt();
+    let kv_stride = 2 * dim;
 
-    // kv is [seq_len, 2 * dim] -> k = [0..dim], v = [dim..2*dim]
-    let k_at = |t: usize, h: usize, d: usize| kv[t * (2 * dim) + h * hd + d];
-    let v_at = |t: usize, h: usize, d: usize| kv[t * (2 * dim) + dim + h * hd + d];
-
-    // Level 1: Coarse trunk queries [num_coarse, dim]
+    // Level 1: Coarse trunk queries [num_coarse, dim] — parallelized over heads
     let nc = pool.num_coarse;
-    let mut logits_c = vec![0.0f32; nh * nc * seq_len];
-    for h in 0..nh {
-        for q in 0..nc {
+    let head_coarse: Vec<Vec<f32>> = (0..nh)
+        .into_par_iter()
+        .map(|h| {
+            let h_off = h * hd;
+            let mut z_h = vec![0.0f32; nc * hd];
+            let mut logits = vec![0.0f32; nc];
             for t in 0..seq_len {
-                let mut dot = 0.0f32;
-                for d in 0..hd {
-                    dot += pool.q_coarse[q * dim + h * hd + d] * k_at(t, h, d);
+                let row = &kv[t * kv_stride..(t + 1) * kv_stride];
+                let kh = &row[h_off..h_off + hd];
+                let vh = &row[dim + h_off..dim + h_off + hd];
+                let mut max_l = f32::NEG_INFINITY;
+                for q in 0..nc {
+                    let qh = &pool.q_coarse[q * dim + h_off..q * dim + h_off + hd];
+                    let mut dot = 0.0f32;
+                    for d in 0..hd {
+                        dot += qh[d] * kh[d];
+                    }
+                    let l = dot * scale;
+                    logits[q] = l;
+                    if l > max_l {
+                        max_l = l;
+                    }
                 }
-                logits_c[(h * nc + q) * seq_len + t] = dot * scale;
-            }
-        }
-    }
-
-    // slot_sigmoid: softmax over queries (dim=-2) * sigmoid(logits + q_coarse_bias)
-    let mut attn_c = vec![0.0f32; nh * nc * seq_len];
-    for h in 0..nh {
-        for t in 0..seq_len {
-            let mut max_l = f32::NEG_INFINITY;
-            for q in 0..nc {
-                let v = logits_c[(h * nc + q) * seq_len + t];
-                if v > max_l {
-                    max_l = v;
+                let mut sum_e = 0.0f32;
+                for q in 0..nc {
+                    sum_e += (logits[q] - max_l).exp();
+                }
+                let inv_sum = 1.0 / sum_e;
+                for q in 0..nc {
+                    let l = logits[q];
+                    let sm = (l - max_l).exp() * inv_sum;
+                    let sig = 1.0 / (1.0 + (-(l + pool.q_coarse_bias[q])).exp());
+                    let a = sm * sig;
+                    let dst = &mut z_h[q * hd..(q + 1) * hd];
+                    for d in 0..hd {
+                        dst[d] += a * vh[d];
+                    }
                 }
             }
-            let mut sum_e = 0.0f32;
-            for q in 0..nc {
-                sum_e += (logits_c[(h * nc + q) * seq_len + t] - max_l).exp();
-            }
-            for q in 0..nc {
-                let l = logits_c[(h * nc + q) * seq_len + t];
-                let sm = (l - max_l).exp() / sum_e;
-                let sig = 1.0 / (1.0 + (-(l + pool.q_coarse_bias[q])).exp());
-                attn_c[(h * nc + q) * seq_len + t] = sm * sig;
-            }
-        }
-    }
+            z_h
+        })
+        .collect();
 
     let mut z_coarse_raw = vec![0.0f32; nc * dim];
-    for q in 0..nc {
-        for h in 0..nh {
-            for t in 0..seq_len {
-                let a = attn_c[(h * nc + q) * seq_len + t];
-                for d in 0..hd {
-                    z_coarse_raw[q * dim + h * hd + d] += a * v_at(t, h, d);
-                }
-            }
+    for (h, z_h) in head_coarse.iter().enumerate() {
+        let h_off = h * hd;
+        for q in 0..nc {
+            z_coarse_raw[q * dim + h_off..q * dim + h_off + hd]
+                .copy_from_slice(&z_h[q * hd..(q + 1) * hd]);
         }
     }
     let z_coarse = layer_norm(&z_coarse_raw, &pool.trunk_norm, nc);
 
-    // Level 2: Child leaf queries [num_queries, dim]
+    // Level 2: Child leaf queries [num_queries, dim] — parallelized over heads
     let nq = pool.num_queries;
     let mut q_leaf_in = vec![0.0f32; nq * dim];
     for c in 0..nc {
@@ -383,62 +387,68 @@ pub fn forward_pool(x_final: &[f32], seq_len: usize, pool: &MHAttnPoolParams, di
     }
     let q_leaf = layer_norm(&q_leaf_in, &pool.child_q_norm, nq);
 
-    let mut logits_l = vec![0.0f32; nh * nq * seq_len];
-    for h in 0..nh {
-        for q in 0..nq {
+    let head_child: Vec<(Vec<f32>, Vec<f32>)> = (0..nh)
+        .into_par_iter()
+        .map(|h| {
+            let h_off = h * hd;
+            let mut z_h = vec![0.0f32; nq * hd];
+            let mut m_h = vec![0.0f32; nq];
+            let mut logits = vec![0.0f32; nq];
             for t in 0..seq_len {
-                let mut dot = 0.0f32;
-                for d in 0..hd {
-                    dot += q_leaf[q * dim + h * hd + d] * k_at(t, h, d);
+                let row = &kv[t * kv_stride..(t + 1) * kv_stride];
+                let kh = &row[h_off..h_off + hd];
+                let vh = &row[dim + h_off..dim + h_off + hd];
+                let mut max_l = f32::NEG_INFINITY;
+                for q in 0..nq {
+                    let qh = &q_leaf[q * dim + h_off..q * dim + h_off + hd];
+                    let mut dot = 0.0f32;
+                    for d in 0..hd {
+                        dot += qh[d] * kh[d];
+                    }
+                    let l = dot * scale;
+                    logits[q] = l;
+                    if l > max_l {
+                        max_l = l;
+                    }
                 }
-                logits_l[(h * nq + q) * seq_len + t] = dot * scale;
-            }
-        }
-    }
-
-    let mut attn_l = vec![0.0f32; nh * nq * seq_len];
-    for h in 0..nh {
-        for t in 0..seq_len {
-            let mut max_l = f32::NEG_INFINITY;
-            for q in 0..nq {
-                let v = logits_l[(h * nq + q) * seq_len + t];
-                if v > max_l {
-                    max_l = v;
+                let mut sum_e = 0.0f32;
+                for q in 0..nq {
+                    sum_e += (logits[q] - max_l).exp();
+                }
+                let inv_sum = 1.0 / sum_e;
+                for q in 0..nq {
+                    let l = logits[q];
+                    let sm = (l - max_l).exp() * inv_sum;
+                    let sig = 1.0 / (1.0 + (-(l + pool.q_child_bias[q])).exp());
+                    let a = sm * sig;
+                    m_h[q] += a;
+                    let dst = &mut z_h[q * hd..(q + 1) * hd];
+                    for d in 0..hd {
+                        dst[d] += a * vh[d];
+                    }
                 }
             }
-            let mut sum_e = 0.0f32;
-            for q in 0..nq {
-                sum_e += (logits_l[(h * nq + q) * seq_len + t] - max_l).exp();
-            }
-            for q in 0..nq {
-                let l = logits_l[(h * nq + q) * seq_len + t];
-                let sm = (l - max_l).exp() / sum_e;
-                let sig = 1.0 / (1.0 + (-(l + pool.q_child_bias[q])).exp());
-                attn_l[(h * nq + q) * seq_len + t] = sm * sig;
-            }
-        }
-    }
+            (z_h, m_h)
+        })
+        .collect();
 
     let mut z_tree_in = vec![0.0f32; nq * dim];
     let mut mass_q = vec![0.0f32; nq];
+    for (h, (z_h, m_h)) in head_child.iter().enumerate() {
+        let h_off = h * hd;
+        for q in 0..nq {
+            mass_q[q] += m_h[q];
+            z_tree_in[q * dim + h_off..q * dim + h_off + hd]
+                .copy_from_slice(&z_h[q * hd..(q + 1) * hd]);
+        }
+    }
     for c in 0..nc {
         for b in 0..pool.branches {
             let q = c * pool.branches + b;
-            for h in 0..nh {
-                let mut sum_a = 0.0f32;
-                for t in 0..seq_len {
-                    let a = attn_l[(h * nq + q) * seq_len + t];
-                    sum_a += a;
-                    for d in 0..hd {
-                        z_tree_in[q * dim + h * hd + d] += a * v_at(t, h, d);
-                    }
-                }
-                mass_q[q] += sum_a;
-            }
+            mass_q[q] /= nh as f32;
             for d in 0..dim {
                 z_tree_in[q * dim + d] += z_coarse[c * dim + d];
             }
-            mass_q[q] /= nh as f32;
         }
     }
 
@@ -453,15 +463,18 @@ pub fn forward_pool(x_final: &[f32], seq_len: usize, pool: &MHAttnPoolParams, di
     // Leaf projection: einsum("bqd,qdf->bqf", z_tree, leaf_proj_weight) + leaf_proj_bias
     let ld = pool.leaf_dim;
     let mut pooled = vec![0.0f32; nq * ld];
-    for q in 0..nq {
-        for f in 0..ld {
-            let mut sum = pool.leaf_proj_bias[q * ld + f];
-            for d in 0..dim {
-                sum += z_tree[q * dim + d] * pool.leaf_proj_weight[(q * dim + d) * ld + f];
+    pooled.par_chunks_mut(ld).enumerate().for_each(|(q, dst)| {
+        dst.copy_from_slice(&pool.leaf_proj_bias[q * ld..(q + 1) * ld]);
+        let z_row = &z_tree[q * dim..(q + 1) * dim];
+        let w_q = &pool.leaf_proj_weight[q * dim * ld..(q + 1) * dim * ld];
+        for d in 0..dim {
+            let zv = z_row[d];
+            let w_row = &w_q[d * ld..(d + 1) * ld];
+            for f in 0..ld {
+                dst[f] += zv * w_row[f];
             }
-            pooled[q * ld + f] = sum;
         }
-    }
+    });
     pooled
 }
 
