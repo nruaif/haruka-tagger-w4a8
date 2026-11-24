@@ -113,7 +113,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#;
 
 // Universal WGSL W4 Linear (works on all Vulkan, DX12, and Metal GPUs in wgpu 24.0 without DP4A):
-// Smooths activations by 1 / awq_scale (simulated A8 or direct FP32) and unpacks signed 4-bit weights via extractBits.
+// Uses coalesced [K_pack, N] weights, [num_groups, N] scales, and pre-inverted awq_scale.
 const W4_UNIVERSAL_WGSL: &str = r#"
 struct Params { m: u32, n: u32, k_pack: u32, num_w_groups: u32, has_bias: u32, pad0: u32, pad1: u32, pad2: u32 };
 @group(0) @binding(0) var<storage, read> x_buf: array<vec4<f32>>;
@@ -131,8 +131,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
     let n = gid.x;
     let m_base = gid.y * 8u;
     let safe_n = min(n, params.n - 1u);
-    let w_row_off = safe_n * params.k_pack;
-    let s_row_off = safe_n * params.num_w_groups;
     let k_vec4_stride = params.k_pack * 2u;
 
     var acc0: f32 = 0.0; var acc1: f32 = 0.0; var acc2: f32 = 0.0; var acc3: f32 = 0.0;
@@ -141,48 +139,75 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
     var grp: u32 = 0u;
     for (var kt: u32 = 0u; kt < params.k_pack; kt = kt + 8u) {
         let t0 = lid.x;
-        let r0 = min(m_base + (t0 >> 4u), params.m - 1u);
-        let r1 = min(m_base + (t0 >> 4u) + 4u, params.m - 1u);
-        let cv = t0 & 15u;
-        let k_v = kt * 2u + cv;
-        let inv_awq = 1.0 / awq_scale[k_v];
-        wg_x[t0] = x_buf[r0 * k_vec4_stride + k_v] * inv_awq;
-        wg_x[t0 + 64u] = x_buf[r1 * k_vec4_stride + k_v] * inv_awq;
+        let valid_j = min(8u, params.k_pack - kt);
+        if (params.m == 1u) {
+            if (t0 < valid_j * 2u) {
+                let k_v = kt * 2u + t0;
+                wg_x[t0] = x_buf[k_v] * awq_scale[k_v];
+            }
+        } else {
+            let r0 = min(m_base + (t0 >> 4u), params.m - 1u);
+            let r1 = min(m_base + (t0 >> 4u) + 4u, params.m - 1u);
+            let cv = t0 & 15u;
+            let k_v = kt * 2u + cv;
+            let inv_awq = awq_scale[k_v];
+            wg_x[t0] = x_buf[r0 * k_vec4_stride + k_v] * inv_awq;
+            wg_x[t0 + 64u] = x_buf[r1 * k_vec4_stride + k_v] * inv_awq;
+        }
         workgroupBarrier();
 
-        var g0: f32 = 0.0; var g1: f32 = 0.0; var g2: f32 = 0.0; var g3: f32 = 0.0;
-        var g4: f32 = 0.0; var g5: f32 = 0.0; var g6: f32 = 0.0; var g7: f32 = 0.0;
-
-        let valid_j = min(8u, params.k_pack - kt);
-        for (var j: u32 = 0u; j < valid_j; j = j + 1u) {
-            let wp: i32 = i32(w_buf[w_row_off + kt + j]);
-            let w_a = vec4<f32>(
-                f32(extractBits(wp,  0u, 4u)),
-                f32(extractBits(wp,  4u, 4u)),
-                f32(extractBits(wp,  8u, 4u)),
-                f32(extractBits(wp, 12u, 4u))
-            );
-            let w_b = vec4<f32>(
-                f32(extractBits(wp, 16u, 4u)),
-                f32(extractBits(wp, 20u, 4u)),
-                f32(extractBits(wp, 24u, 4u)),
-                f32(extractBits(wp, 28u, 4u))
-            );
-            let j0 = j * 2u;
-            let j1 = j0 + 1u;
-            g0 += dot(wg_x[0u * 16u + j0], w_a) + dot(wg_x[0u * 16u + j1], w_b);
-            g1 += dot(wg_x[1u * 16u + j0], w_a) + dot(wg_x[1u * 16u + j1], w_b);
-            g2 += dot(wg_x[2u * 16u + j0], w_a) + dot(wg_x[2u * 16u + j1], w_b);
-            g3 += dot(wg_x[3u * 16u + j0], w_a) + dot(wg_x[3u * 16u + j1], w_b);
-            g4 += dot(wg_x[4u * 16u + j0], w_a) + dot(wg_x[4u * 16u + j1], w_b);
-            g5 += dot(wg_x[5u * 16u + j0], w_a) + dot(wg_x[5u * 16u + j1], w_b);
-            g6 += dot(wg_x[6u * 16u + j0], w_a) + dot(wg_x[6u * 16u + j1], w_b);
-            g7 += dot(wg_x[7u * 16u + j0], w_a) + dot(wg_x[7u * 16u + j1], w_b);
+        let ws = w_scales[grp * params.n + safe_n];
+        if (params.m == 1u) {
+            var g0: f32 = 0.0;
+            for (var j: u32 = 0u; j < valid_j; j = j + 1u) {
+                let wp: i32 = i32(w_buf[(kt + j) * params.n + safe_n]);
+                let w_a = vec4<f32>(
+                    f32(extractBits(wp,  0u, 4u)),
+                    f32(extractBits(wp,  4u, 4u)),
+                    f32(extractBits(wp,  8u, 4u)),
+                    f32(extractBits(wp, 12u, 4u))
+                );
+                let w_b = vec4<f32>(
+                    f32(extractBits(wp, 16u, 4u)),
+                    f32(extractBits(wp, 20u, 4u)),
+                    f32(extractBits(wp, 24u, 4u)),
+                    f32(extractBits(wp, 28u, 4u))
+                );
+                let j0 = j * 2u;
+                g0 += dot(wg_x[j0], w_a) + dot(wg_x[j0 + 1u], w_b);
+            }
+            acc0 += g0 * ws;
+        } else {
+            var g0: f32 = 0.0; var g1: f32 = 0.0; var g2: f32 = 0.0; var g3: f32 = 0.0;
+            var g4: f32 = 0.0; var g5: f32 = 0.0; var g6: f32 = 0.0; var g7: f32 = 0.0;
+            for (var j: u32 = 0u; j < valid_j; j = j + 1u) {
+                let wp: i32 = i32(w_buf[(kt + j) * params.n + safe_n]);
+                let w_a = vec4<f32>(
+                    f32(extractBits(wp,  0u, 4u)),
+                    f32(extractBits(wp,  4u, 4u)),
+                    f32(extractBits(wp,  8u, 4u)),
+                    f32(extractBits(wp, 12u, 4u))
+                );
+                let w_b = vec4<f32>(
+                    f32(extractBits(wp, 16u, 4u)),
+                    f32(extractBits(wp, 20u, 4u)),
+                    f32(extractBits(wp, 24u, 4u)),
+                    f32(extractBits(wp, 28u, 4u))
+                );
+                let j0 = j * 2u;
+                let j1 = j0 + 1u;
+                g0 += dot(wg_x[0u * 16u + j0], w_a) + dot(wg_x[0u * 16u + j1], w_b);
+                g1 += dot(wg_x[1u * 16u + j0], w_a) + dot(wg_x[1u * 16u + j1], w_b);
+                g2 += dot(wg_x[2u * 16u + j0], w_a) + dot(wg_x[2u * 16u + j1], w_b);
+                g3 += dot(wg_x[3u * 16u + j0], w_a) + dot(wg_x[3u * 16u + j1], w_b);
+                g4 += dot(wg_x[4u * 16u + j0], w_a) + dot(wg_x[4u * 16u + j1], w_b);
+                g5 += dot(wg_x[5u * 16u + j0], w_a) + dot(wg_x[5u * 16u + j1], w_b);
+                g6 += dot(wg_x[6u * 16u + j0], w_a) + dot(wg_x[6u * 16u + j1], w_b);
+                g7 += dot(wg_x[7u * 16u + j0], w_a) + dot(wg_x[7u * 16u + j1], w_b);
+            }
+            acc0 += g0 * ws; acc1 += g1 * ws; acc2 += g2 * ws; acc3 += g3 * ws;
+            acc4 += g4 * ws; acc5 += g5 * ws; acc6 += g6 * ws; acc7 += g7 * ws;
         }
-
-        let ws = w_scales[s_row_off + grp];
-        acc0 += g0 * ws; acc1 += g1 * ws; acc2 += g2 * ws; acc3 += g3 * ws;
-        acc4 += g4 * ws; acc5 += g5 * ws; acc6 += g6 * ws; acc7 += g7 * ws;
         grp = grp + 1u;
         workgroupBarrier();
     }
@@ -289,63 +314,79 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 const ATTN_WGSL: &str = r#"
 struct AttnParams { seq_len: u32, dim: u32, num_heads: u32, head_dim: u32, scale: f32, pad0: u32, pad1: u32, pad2: u32 };
-@group(0) @binding(0) var<storage, read> q_buf: array<f32>;
-@group(0) @binding(1) var<storage, read> k_buf: array<f32>;
-@group(0) @binding(2) var<storage, read> v_buf: array<f32>;
-@group(0) @binding(3) var<storage, read_write> out_buf: array<f32>;
+@group(0) @binding(0) var<storage, read> q_buf: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> k_buf: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> v_buf: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> out_buf: array<vec4<f32>>;
 @group(0) @binding(4) var<uniform> p: AttnParams;
 
-var<workgroup> sm_dot: array<f32, 64>;
+var<workgroup> sm_k: array<vec4<f32>, 256>;
+var<workgroup> sm_v: array<vec4<f32>, 256>;
 
-// One workgroup (64 threads) per (query_token, head), each thread owns dimension d = lid.x!
+// Tiled FlashAttention: BQ = 64 queries per workgroup, BK = 16 keys per tile, head_dim = 64 (16 vec4<f32>)
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let idx = wgid.x;
-    let total = p.seq_len * p.num_heads;
-    if (idx >= total) { return; }
+    let qi = wgid.x * 64u + lid.x;
+    let h = wgid.y;
+    let valid_q = qi < p.seq_len && h < p.num_heads;
+    let dim_v4 = p.dim / 4u;
+    let h_v4 = h * 16u;
 
-    let d = lid.x;
-    let valid_d = d < p.head_dim;
-    let qi = idx / p.num_heads;
-    let h = idx % p.num_heads;
-    let q_off = qi * p.dim + h * p.head_dim;
-
-    let q_d = select(0.0, q_buf[q_off + d], valid_d);
+    var q_reg: array<vec4<f32>, 16>;
+    var acc: array<vec4<f32>, 16>;
+    for (var d: u32 = 0u; d < 16u; d = d + 1u) {
+        q_reg[d] = select(vec4<f32>(0.0), q_buf[qi * dim_v4 + h_v4 + d], valid_q);
+        acc[d] = vec4<f32>(0.0);
+    }
 
     var m_prev: f32 = -1e30;
     var l_prev: f32 = 0.0;
-    var acc_d: f32 = 0.0;
 
-    for (var ki: u32 = 0u; ki < p.seq_len; ki = ki + 1u) {
-        let k_off = ki * p.dim + h * p.head_dim;
-        sm_dot[d] = select(0.0, q_d * k_buf[k_off + d], valid_d);
-        workgroupBarrier();
-        if (d < 32u) { sm_dot[d] += sm_dot[d + 32u]; }
-        workgroupBarrier();
-        if (d < 16u) { sm_dot[d] += sm_dot[d + 16u]; }
-        workgroupBarrier();
-        if (d < 8u) { sm_dot[d] += sm_dot[d + 8u]; }
-        workgroupBarrier();
-        if (d < 4u) { sm_dot[d] += sm_dot[d + 4u]; }
-        workgroupBarrier();
-        if (d < 2u) { sm_dot[d] += sm_dot[d + 2u]; }
-        workgroupBarrier();
-        if (d == 0u) { sm_dot[0] += sm_dot[1]; }
-        workgroupBarrier();
-
-        let s = sm_dot[0] * p.scale;
-        let m_new = max(m_prev, s);
-        let alpha = exp(m_prev - m_new);
-        let beta = exp(s - m_new);
-        l_prev = l_prev * alpha + beta;
-        if (valid_d) {
-            acc_d = acc_d * alpha + beta * v_buf[k_off + d];
+    for (var k_base: u32 = 0u; k_base < p.seq_len; k_base = k_base + 16u) {
+        for (var c: u32 = 0u; c < 4u; c = c + 1u) {
+            let slot = c * 64u + lid.x;
+            let lk = slot >> 4u;
+            let lv = slot & 15u;
+            let gk = k_base + lk;
+            if (gk < p.seq_len) {
+                let g_idx = gk * dim_v4 + h_v4 + lv;
+                sm_k[slot] = k_buf[g_idx];
+                sm_v[slot] = v_buf[g_idx];
+            } else {
+                sm_k[slot] = vec4<f32>(0.0);
+                sm_v[slot] = vec4<f32>(0.0);
+            }
         }
-        m_prev = m_new;
+        workgroupBarrier();
+
+        if (valid_q) {
+            let tile_k = min(16u, p.seq_len - k_base);
+            for (var lk: u32 = 0u; lk < tile_k; lk = lk + 1u) {
+                let k_off = lk * 16u;
+                var dot_v: f32 = 0.0;
+                for (var d: u32 = 0u; d < 16u; d = d + 1u) {
+                    dot_v += dot(q_reg[d], sm_k[k_off + d]);
+                }
+                let s = dot_v * p.scale;
+                let m_new = max(m_prev, s);
+                let alpha = exp(m_prev - m_new);
+                let beta = exp(s - m_new);
+                l_prev = l_prev * alpha + beta;
+                for (var d: u32 = 0u; d < 16u; d = d + 1u) {
+                    acc[d] = acc[d] * alpha + beta * sm_v[k_off + d];
+                }
+                m_prev = m_new;
+            }
+        }
+        workgroupBarrier();
     }
 
-    if (valid_d) {
-        out_buf[q_off + d] = acc_d / l_prev;
+    if (valid_q) {
+        let inv_l = 1.0 / l_prev;
+        let out_off = qi * dim_v4 + h_v4;
+        for (var d: u32 = 0u; d < 16u; d = d + 1u) {
+            out_buf[out_off + d] = acc[d] * inv_l;
+        }
     }
 }
 "#;
@@ -519,13 +560,32 @@ fn upload_f32(device: &wgpu::Device, label: &str, data: &[f32]) -> wgpu::Buffer 
 }
 
 fn upload_w4(device: &wgpu::Device, label: &str, lin: &W4Linear) -> GpuW4Linear {
+    let n_out = lin.out_features;
+    let k_pack = lin.in_features / 8;
+    let mut w_t = vec![0u32; k_pack * n_out];
+    for n in 0..n_out {
+        for kp in 0..k_pack {
+            w_t[kp * n_out + n] = lin.qweight_u32_signed[n * k_pack + kp];
+        }
+    }
     let w_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some(label),
-        contents: bytemuck::cast_slice(&lin.qweight_u32_signed),
+        contents: bytemuck::cast_slice(&w_t),
         usage: wgpu::BufferUsages::STORAGE,
     });
-    let w_scales_buf = upload_f32(device, "w_scales", &lin.scales);
-    let awq_scale_buf = upload_f32(device, "awq_scale", &lin.awq_scale);
+
+    let ng = lin.num_groups;
+    let mut scales_t = vec![0.0f32; ng * n_out];
+    for n in 0..n_out {
+        for g in 0..ng {
+            scales_t[g * n_out + n] = lin.scales[n * ng + g];
+        }
+    }
+    let w_scales_buf = upload_f32(device, "w_scales", &scales_t);
+
+    let inv_awq: Vec<f32> = lin.awq_scale.iter().map(|&s| 1.0f32 / s).collect();
+    let awq_scale_buf = upload_f32(device, "awq_scale", &inv_awq);
+
     let dummy_bias = [0.0f32];
     let bias_slice = lin.bias.as_deref().unwrap_or(&dummy_bias);
     let bias_buf = upload_f32(device, "bias", bias_slice);
@@ -890,7 +950,8 @@ impl WgpuRunner {
         let tok_wg = ((seq_len * dim + 63) / 64) as u32;
         let mlp_wg = ((seq_len * mlp_hidden + 63) / 64) as u32;
         let rope_wg = ((n_pairs + 63) / 64) as u32;
-        let attn_wg = (seq_len * model.num_heads) as u32;
+        let attn_q_wg = ((seq_len + 63) / 64) as u32;
+        let attn_h_wg = model.num_heads as u32;
 
         for blk in &self.blocks {
             self.encode_ln(&mut enc, &self.x_buf, &blk.norm1, &self.h_buf, &self.u_ln_dim, seq_len);
@@ -908,7 +969,7 @@ impl WgpuRunner {
                 let mut pass = enc.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&self.attn_pipe);
                 pass.set_bind_group(0, &attn_bg, &[]);
-                pass.dispatch_workgroups(attn_wg, 1, 1);
+                pass.dispatch_workgroups(attn_q_wg, attn_h_wg, 1);
             }
 
             self.encode_w4a8(&mut enc, &self.attn_out_buf, &blk.proj, &self.delta_buf, &self.u_gemm_qkv, seq_len);

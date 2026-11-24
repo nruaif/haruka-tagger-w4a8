@@ -9,7 +9,9 @@ use haruka_w4a8::io::{
 use haruka_w4a8::model::HarukaModel;
 use haruka_w4a8::wgpu_backend::WgpuRunner;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
@@ -38,6 +40,7 @@ struct HarukaGuiApp {
     results: Vec<ImagePrediction>,
     selected_idx: usize,
     rx: Option<Receiver<WorkerMsg>>,
+    cancel_flag: Option<Arc<AtomicBool>>,
     preview_tex: Option<(String, egui::TextureHandle)>,
 }
 
@@ -60,6 +63,7 @@ impl Default for HarukaGuiApp {
             results: Vec::new(),
             selected_idx: 0,
             rx: None,
+            cancel_flag: None,
             preview_tex: None,
         }
     }
@@ -93,7 +97,9 @@ impl HarukaGuiApp {
         };
 
         let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
         self.rx = Some(rx);
+        self.cancel_flag = Some(cancel.clone());
         self.running = true;
         self.results.clear();
         self.selected_idx = 0;
@@ -136,6 +142,9 @@ impl HarukaGuiApp {
 
                 let total_t0 = Instant::now();
                 let count = for_each_image(&input, input_format, model.meta.img_size, |name, nchw| {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Ok(false);
+                    }
                     let t0 = Instant::now();
                     let probs = match &runner {
                         Some(r) => r.infer(&model, &nchw),
@@ -152,20 +161,31 @@ impl HarukaGuiApp {
                     let _ = tx.send(WorkerMsg::Status(format!("Tagged {name} ({dt:.0} ms)")));
                     let _ = tx.send(WorkerMsg::Result(pred));
                     ctx.request_repaint();
-                    Ok(())
+                    Ok(!cancel.load(Ordering::Relaxed))
                 })?;
 
-                write_outputs(
-                    &collected,
-                    output_format,
-                    output_path.as_deref(),
-                    filter_opts.save_probs,
-                )?;
-                let _ = tx.send(WorkerMsg::Done(format!(
-                    "Done: {count} image(s) in {:.2} s | {}",
-                    total_t0.elapsed().as_secs_f64(),
-                    backend_name
-                )));
+                if !collect || !collected.is_empty() {
+                    write_outputs(
+                        &collected,
+                        output_format,
+                        output_path.as_deref(),
+                        filter_opts.save_probs,
+                    )?;
+                }
+                let msg = if cancel.load(Ordering::Relaxed) {
+                    format!(
+                        "Stopped after {count} image(s) in {:.2} s | {}",
+                        total_t0.elapsed().as_secs_f64(),
+                        backend_name
+                    )
+                } else {
+                    format!(
+                        "Done: {count} image(s) in {:.2} s | {}",
+                        total_t0.elapsed().as_secs_f64(),
+                        backend_name
+                    )
+                };
+                let _ = tx.send(WorkerMsg::Done(msg));
                 Ok(())
             };
 
@@ -197,6 +217,7 @@ impl HarukaGuiApp {
         if finished {
             self.running = false;
             self.rx = None;
+            self.cancel_flag = None;
         }
     }
 
@@ -350,12 +371,23 @@ impl eframe::App for HarukaGuiApp {
                 ui.checkbox(&mut self.save_probs, "Save probabilities");
 
                 ui.add_space(8.0);
-                if ui
-                    .add_enabled(!self.running, egui::Button::new("Run Tagging"))
-                    .clicked()
-                {
-                    self.start_run(ctx.clone());
-                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!self.running, egui::Button::new("Run Tagging"))
+                        .clicked()
+                    {
+                        self.start_run(ctx.clone());
+                    }
+                    if ui
+                        .add_enabled(self.running, egui::Button::new("Stop"))
+                        .clicked()
+                    {
+                        if let Some(cancel) = &self.cancel_flag {
+                            cancel.store(true, Ordering::Relaxed);
+                            self.status = "Stopping after current image...".to_string();
+                        }
+                    }
+                });
                 ui.add_space(6.0);
                 ui.label(&self.status);
             });

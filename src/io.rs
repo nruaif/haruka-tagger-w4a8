@@ -131,7 +131,7 @@ pub fn for_each_image<F>(
     mut cb: F,
 ) -> Result<usize>
 where
-    F: FnMut(&str, Vec<f32>) -> Result<()>,
+    F: FnMut(&str, Vec<f32>) -> Result<bool>,
 {
     let effective = match format {
         InputFormat::Auto => {
@@ -166,8 +166,11 @@ where
             for p in paths {
                 let nchw = preprocess_image(&p, img_size)?;
                 let name = p.to_string_lossy().into_owned();
-                cb(&name, nchw)?;
+                let cont = cb(&name, nchw)?;
                 count += 1;
+                if !cont {
+                    break;
+                }
             }
         }
         InputFormat::Webdataset => {
@@ -175,18 +178,24 @@ where
             if shards.is_empty() {
                 bail!("No WebDataset .tar/.tar.gz shards found at {}", input.display());
             }
+            let mut stopped = false;
             for shard in shards {
                 let file = File::open(&shard)
                     .with_context(|| format!("Failed to open shard {}", shard.display()))?;
                 let gz = shard.to_string_lossy().to_ascii_lowercase();
-                if gz.ends_with(".tar.gz") || gz.ends_with(".tgz") {
+                let (n, cont) = if gz.ends_with(".tar.gz") || gz.ends_with(".tgz") {
                     let dec = GzDecoder::new(BufReader::new(file));
-                    count += read_tar_stream(dec, img_size, &mut cb)?;
+                    read_tar_stream(dec, img_size, &mut cb)?
                 } else {
-                    count += read_tar_stream(BufReader::new(file), img_size, &mut cb)?;
+                    read_tar_stream(BufReader::new(file), img_size, &mut cb)?
+                };
+                count += n;
+                if !cont {
+                    stopped = true;
+                    break;
                 }
             }
-            if count == 0 {
+            if count == 0 && !stopped {
                 bail!("No images found inside WebDataset shard(s) at {}", input.display());
             }
         }
@@ -224,9 +233,9 @@ fn collect_tar_shards(input: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-fn read_tar_stream<R: Read, F>(reader: R, img_size: usize, cb: &mut F) -> Result<usize>
+fn read_tar_stream<R: Read, F>(reader: R, img_size: usize, cb: &mut F) -> Result<(usize, bool)>
 where
-    F: FnMut(&str, Vec<f32>) -> Result<()>,
+    F: FnMut(&str, Vec<f32>) -> Result<bool>,
 {
     let mut archive = Archive::new(reader);
     let mut count = 0usize;
@@ -243,10 +252,13 @@ where
         buf.clear();
         entry.read_to_end(&mut buf)?;
         let nchw = preprocess_image_bytes(&buf, img_size)?;
-        cb(&path_str, nchw)?;
+        let cont = cb(&path_str, nchw)?;
         count += 1;
+        if !cont {
+            return Ok((count, false));
+        }
     }
-    Ok(count)
+    Ok((count, true))
 }
 
 pub fn print_stdout(pred: &ImagePrediction) {

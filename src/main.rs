@@ -160,7 +160,7 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Ok(())
+        Ok(true)
     })?;
 
     write_outputs(&preds, format, args.output.as_deref(), filter_opts.save_probs)?;
