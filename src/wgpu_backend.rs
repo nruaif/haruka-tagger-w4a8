@@ -13,7 +13,7 @@ struct GemmParams {
     k_pack: u32,
     num_w_groups: u32,
     has_bias: u32,
-    pad0: u32,
+    num_act_groups: u32,
     pad1: u32,
     pad2: u32,
 }
@@ -22,9 +22,9 @@ struct GemmParams {
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct QuantParams {
     m: u32,
-    k: u32,
-    act_gs: u32,
+    k_vec4: u32,
     num_act_groups: u32,
+    pad0: u32,
 }
 
 #[repr(C)]
@@ -67,71 +67,75 @@ struct PatchParams {
     dim: u32,
 }
 
-#[allow(dead_code)]
 const QUANT_A8_WGSL: &str = r#"
-struct QParams { m: u32, k: u32, act_gs: u32, num_act_groups: u32 };
-@group(0) @binding(0) var<storage, read> x_in: array<f32>;
-@group(0) @binding(1) var<storage, read> awq_scale: array<f32>;
+struct QParams { m: u32, k_vec4: u32, num_act_groups: u32, pad0: u32 };
+@group(0) @binding(0) var<storage, read> x_in: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> inv_awq_scale: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read_write> x_q_packed: array<u32>;
 @group(0) @binding(3) var<storage, read_write> x_scales: array<f32>;
 @group(0) @binding(4) var<uniform> qp: QParams;
 
-// One thread per (row, act_group)
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    let total = qp.m * qp.num_act_groups;
-    if (idx >= total) { return; }
+var<workgroup> sm_max: array<f32, 32>;
 
-    let row = idx / qp.num_act_groups;
-    let ag = idx % qp.num_act_groups;
-    let k_start = ag * qp.act_gs;
-    let k_end = min(k_start + qp.act_gs, qp.k);
-    let row_off = row * qp.k;
+// 1 workgroup (32 threads) per (row, act_group=128); each thread handles 4 consecutive floats (1 vec4)
+@compute @workgroup_size(32)
+fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = wgid.x;
+    let ag = wgid.y;
+    let t = lid.x;
+    let kv = ag * 32u + t;
 
-    var amax: f32 = 1e-6;
-    for (var k: u32 = k_start; k < k_end; k = k + 1u) {
-        let v = abs(x_in[row_off + k] / awq_scale[k]);
-        amax = max(amax, v);
-    }
-    let sc = amax / 127.0;
-    x_scales[idx] = sc;
+    let v = x_in[row * qp.k_vec4 + kv] * inv_awq_scale[kv];
+    let av = abs(v);
+    sm_max[t] = max(max(av.x, av.y), max(av.z, av.w));
+    workgroupBarrier();
+
+    if (t < 16u) { sm_max[t] = max(sm_max[t], sm_max[t + 16u]); }
+    workgroupBarrier();
+    if (t < 8u) { sm_max[t] = max(sm_max[t], sm_max[t + 8u]); }
+    workgroupBarrier();
+    if (t < 4u) { sm_max[t] = max(sm_max[t], sm_max[t + 4u]); }
+    workgroupBarrier();
+    if (t < 2u) { sm_max[t] = max(sm_max[t], sm_max[t + 2u]); }
+    workgroupBarrier();
+    if (t == 0u) { sm_max[0] = max(sm_max[0], sm_max[1]); }
+    workgroupBarrier();
+
+    let sc = max(sm_max[0], 1e-6) / 127.0;
     let inv_sc = 1.0 / sc;
-
-    // Pack 4 int8 values per u32
-    for (var k: u32 = k_start; k < k_end; k = k + 4u) {
-        var word: u32 = 0u;
-        for (var j: u32 = 0u; j < 4u; j = j + 1u) {
-            if (k + j < k_end) {
-                let q = i32(clamp(round((x_in[row_off + k + j] / awq_scale[k + j]) * inv_sc), -127.0, 127.0));
-                word = word | ((u32(q) & 0xFFu) << (j * 8u));
-            }
-        }
-        x_q_packed[(row_off + k) >> 2u] = word;
+    let q = vec4<i32>(clamp(round(v * inv_sc), vec4<f32>(-127.0), vec4<f32>(127.0)));
+    let word = (u32(q.x) & 0xFFu)
+        | ((u32(q.y) & 0xFFu) << 8u)
+        | ((u32(q.z) & 0xFFu) << 16u)
+        | ((u32(q.w) & 0xFFu) << 24u);
+    x_q_packed[row * qp.k_vec4 + kv] = word;
+    if (t == 0u) {
+        x_scales[row * qp.num_act_groups + ag] = sc;
     }
 }
 "#;
 
-// Universal WGSL W4 Linear (works on all Vulkan, DX12, and Metal GPUs in wgpu 24.0 without DP4A):
-// Uses coalesced [K_pack, N] weights, [num_groups, N] scales, and pre-inverted awq_scale.
-const W4_UNIVERSAL_WGSL: &str = r#"
-struct Params { m: u32, n: u32, k_pack: u32, num_w_groups: u32, has_bias: u32, pad0: u32, pad1: u32, pad2: u32 };
-@group(0) @binding(0) var<storage, read> x_buf: array<vec4<f32>>;
-@group(0) @binding(1) var<storage, read> awq_scale: array<vec4<f32>>;
+// Hardware W4A8 DP4A Linear (dot4I8Packed via wgpu 30 / naga):
+// Uses coalesced pre-interleaved [K_pack, N] weights, [num_groups, N] scales, and quantized A8 activations.
+const W4A8_DP4A_WGSL: &str = r#"
+struct Params { m: u32, n: u32, k_pack: u32, num_w_groups: u32, has_bias: u32, num_act_groups: u32, pad1: u32, pad2: u32 };
+@group(0) @binding(0) var<storage, read> x_q_packed: array<u32>;
+@group(0) @binding(1) var<storage, read> x_scales: array<f32>;
 @group(0) @binding(2) var<storage, read> w_buf: array<u32>;
 @group(0) @binding(3) var<storage, read> w_scales: array<f32>;
 @group(0) @binding(4) var<storage, read> bias_buf: array<f32>;
 @group(0) @binding(5) var<storage, read_write> out_buf: array<f32>;
 @group(0) @binding(6) var<uniform> params: Params;
 
-var<workgroup> wg_x: array<vec4<f32>, 128>; // 8 rows x 16 vec4<f32> (64 floats = 1 weight group)
+var<workgroup> wg_x: array<u32, 128>; // 8 rows x 16 u32 (64 int8 values = 1 weight group)
+var<workgroup> wg_xs: array<f32, 8>;  // 1 activation scale per row for current group
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let n = gid.x;
     let m_base = gid.y * 8u;
     let safe_n = min(n, params.n - 1u);
-    let k_vec4_stride = params.k_pack * 2u;
+    let k_u32_stride = params.k_pack * 2u;
 
     var acc0: f32 = 0.0; var acc1: f32 = 0.0; var acc2: f32 = 0.0; var acc3: f32 = 0.0;
     var acc4: f32 = 0.0; var acc5: f32 = 0.0; var acc6: f32 = 0.0; var acc7: f32 = 0.0;
@@ -140,73 +144,68 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
     for (var kt: u32 = 0u; kt < params.k_pack; kt = kt + 8u) {
         let t0 = lid.x;
         let valid_j = min(8u, params.k_pack - kt);
+        let ag = grp >> 1u;
         if (params.m == 1u) {
             if (t0 < valid_j * 2u) {
-                let k_v = kt * 2u + t0;
-                wg_x[t0] = x_buf[k_v] * awq_scale[k_v];
+                wg_x[t0] = x_q_packed[kt * 2u + t0];
+            }
+            if (t0 == 0u) {
+                wg_xs[0] = x_scales[ag];
             }
         } else {
             let r0 = min(m_base + (t0 >> 4u), params.m - 1u);
             let r1 = min(m_base + (t0 >> 4u) + 4u, params.m - 1u);
             let cv = t0 & 15u;
-            let k_v = kt * 2u + cv;
-            let inv_awq = awq_scale[k_v];
-            wg_x[t0] = x_buf[r0 * k_vec4_stride + k_v] * inv_awq;
-            wg_x[t0 + 64u] = x_buf[r1 * k_vec4_stride + k_v] * inv_awq;
+            let k_u = kt * 2u + cv;
+            wg_x[t0] = x_q_packed[r0 * k_u32_stride + k_u];
+            wg_x[t0 + 64u] = x_q_packed[r1 * k_u32_stride + k_u];
+            if (t0 < 8u) {
+                wg_xs[t0] = x_scales[min(m_base + t0, params.m - 1u) * params.num_act_groups + ag];
+            }
         }
         workgroupBarrier();
 
         let ws = w_scales[grp * params.n + safe_n];
         if (params.m == 1u) {
-            var g0: f32 = 0.0;
+            var g0: i32 = 0;
             for (var j: u32 = 0u; j < valid_j; j = j + 1u) {
-                let wp: i32 = i32(w_buf[(kt + j) * params.n + safe_n]);
-                let w_a = vec4<f32>(
-                    f32(extractBits(wp,  0u, 4u)),
-                    f32(extractBits(wp,  4u, 4u)),
-                    f32(extractBits(wp,  8u, 4u)),
-                    f32(extractBits(wp, 12u, 4u))
-                );
-                let w_b = vec4<f32>(
-                    f32(extractBits(wp, 16u, 4u)),
-                    f32(extractBits(wp, 20u, 4u)),
-                    f32(extractBits(wp, 24u, 4u)),
-                    f32(extractBits(wp, 28u, 4u))
-                );
+                let wp = w_buf[(kt + j) * params.n + safe_n];
+                let lo_u = wp & 0x0F0F0F0Fu;
+                let lo_i8 = lo_u | ((lo_u & 0x08080808u) * 30u);
+                let hi_u = (wp >> 4u) & 0x0F0F0F0Fu;
+                let hi_i8 = hi_u | ((hi_u & 0x08080808u) * 30u);
                 let j0 = j * 2u;
-                g0 += dot(wg_x[j0], w_a) + dot(wg_x[j0 + 1u], w_b);
+                g0 += dot4I8Packed(wg_x[j0], lo_i8) + dot4I8Packed(wg_x[j0 + 1u], hi_i8);
             }
-            acc0 += g0 * ws;
+            acc0 += f32(g0) * (ws * wg_xs[0]);
         } else {
-            var g0: f32 = 0.0; var g1: f32 = 0.0; var g2: f32 = 0.0; var g3: f32 = 0.0;
-            var g4: f32 = 0.0; var g5: f32 = 0.0; var g6: f32 = 0.0; var g7: f32 = 0.0;
+            var g0: i32 = 0; var g1: i32 = 0; var g2: i32 = 0; var g3: i32 = 0;
+            var g4: i32 = 0; var g5: i32 = 0; var g6: i32 = 0; var g7: i32 = 0;
             for (var j: u32 = 0u; j < valid_j; j = j + 1u) {
-                let wp: i32 = i32(w_buf[(kt + j) * params.n + safe_n]);
-                let w_a = vec4<f32>(
-                    f32(extractBits(wp,  0u, 4u)),
-                    f32(extractBits(wp,  4u, 4u)),
-                    f32(extractBits(wp,  8u, 4u)),
-                    f32(extractBits(wp, 12u, 4u))
-                );
-                let w_b = vec4<f32>(
-                    f32(extractBits(wp, 16u, 4u)),
-                    f32(extractBits(wp, 20u, 4u)),
-                    f32(extractBits(wp, 24u, 4u)),
-                    f32(extractBits(wp, 28u, 4u))
-                );
+                let wp = w_buf[(kt + j) * params.n + safe_n];
+                let lo_u = wp & 0x0F0F0F0Fu;
+                let lo_i8 = lo_u | ((lo_u & 0x08080808u) * 30u);
+                let hi_u = (wp >> 4u) & 0x0F0F0F0Fu;
+                let hi_i8 = hi_u | ((hi_u & 0x08080808u) * 30u);
                 let j0 = j * 2u;
                 let j1 = j0 + 1u;
-                g0 += dot(wg_x[0u * 16u + j0], w_a) + dot(wg_x[0u * 16u + j1], w_b);
-                g1 += dot(wg_x[1u * 16u + j0], w_a) + dot(wg_x[1u * 16u + j1], w_b);
-                g2 += dot(wg_x[2u * 16u + j0], w_a) + dot(wg_x[2u * 16u + j1], w_b);
-                g3 += dot(wg_x[3u * 16u + j0], w_a) + dot(wg_x[3u * 16u + j1], w_b);
-                g4 += dot(wg_x[4u * 16u + j0], w_a) + dot(wg_x[4u * 16u + j1], w_b);
-                g5 += dot(wg_x[5u * 16u + j0], w_a) + dot(wg_x[5u * 16u + j1], w_b);
-                g6 += dot(wg_x[6u * 16u + j0], w_a) + dot(wg_x[6u * 16u + j1], w_b);
-                g7 += dot(wg_x[7u * 16u + j0], w_a) + dot(wg_x[7u * 16u + j1], w_b);
+                g0 += dot4I8Packed(wg_x[0u * 16u + j0], lo_i8) + dot4I8Packed(wg_x[0u * 16u + j1], hi_i8);
+                g1 += dot4I8Packed(wg_x[1u * 16u + j0], lo_i8) + dot4I8Packed(wg_x[1u * 16u + j1], hi_i8);
+                g2 += dot4I8Packed(wg_x[2u * 16u + j0], lo_i8) + dot4I8Packed(wg_x[2u * 16u + j1], hi_i8);
+                g3 += dot4I8Packed(wg_x[3u * 16u + j0], lo_i8) + dot4I8Packed(wg_x[3u * 16u + j1], hi_i8);
+                g4 += dot4I8Packed(wg_x[4u * 16u + j0], lo_i8) + dot4I8Packed(wg_x[4u * 16u + j1], hi_i8);
+                g5 += dot4I8Packed(wg_x[5u * 16u + j0], lo_i8) + dot4I8Packed(wg_x[5u * 16u + j1], hi_i8);
+                g6 += dot4I8Packed(wg_x[6u * 16u + j0], lo_i8) + dot4I8Packed(wg_x[6u * 16u + j1], hi_i8);
+                g7 += dot4I8Packed(wg_x[7u * 16u + j0], lo_i8) + dot4I8Packed(wg_x[7u * 16u + j1], hi_i8);
             }
-            acc0 += g0 * ws; acc1 += g1 * ws; acc2 += g2 * ws; acc3 += g3 * ws;
-            acc4 += g4 * ws; acc5 += g5 * ws; acc6 += g6 * ws; acc7 += g7 * ws;
+            acc0 += f32(g0) * (ws * wg_xs[0]);
+            acc1 += f32(g1) * (ws * wg_xs[1]);
+            acc2 += f32(g2) * (ws * wg_xs[2]);
+            acc3 += f32(g3) * (ws * wg_xs[3]);
+            acc4 += f32(g4) * (ws * wg_xs[4]);
+            acc5 += f32(g5) * (ws * wg_xs[5]);
+            acc6 += f32(g6) * (ws * wg_xs[6]);
+            acc7 += f32(g7) * (ws * wg_xs[7]);
         }
         grp = grp + 1u;
         workgroupBarrier();
@@ -503,6 +502,7 @@ pub struct WgpuRunner {
     pub adapter_name: String,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    quant_pipe: wgpu::ComputePipeline,
     w4a8_pipe: wgpu::ComputePipeline,
     ln_pipe: wgpu::ComputePipeline,
     rope_pipe: wgpu::ComputePipeline,
@@ -533,6 +533,8 @@ pub struct WgpuRunner {
     fg_buf: wgpu::Buffer,
     fx_buf: wgpu::Buffer,
     delta_buf: wgpu::Buffer,
+    x_q_buf: wgpu::Buffer,
+    x_sc_buf: wgpu::Buffer,
     pool_in_buf: wgpu::Buffer,
     head_out_buf: wgpu::Buffer,
     readback_buf: wgpu::Buffer,
@@ -544,6 +546,9 @@ pub struct WgpuRunner {
     u_ln_mlp: wgpu::Buffer,
     u_elem_tok: wgpu::Buffer,
     u_elem_mlp: wgpu::Buffer,
+    u_quant_dim: wgpu::Buffer,
+    u_quant_mlp: wgpu::Buffer,
+    u_quant_head: wgpu::Buffer,
     u_gemm_qkv: wgpu::Buffer,
     u_gemm_k: wgpu::Buffer,
     u_gemm_fc1: wgpu::Buffer,
@@ -559,13 +564,26 @@ fn upload_f32(device: &wgpu::Device, label: &str, data: &[f32]) -> wgpu::Buffer 
     })
 }
 
+/// Reorders 8 packed 4-bit weights `[w0..w7]` into `[w0,w4, w1,w5, w2,w6, w3,w7]`
+/// so `lo_u = wp & 0x0F0F0F0F` holds `[w0..w3]` and `hi_u = (wp >> 4) & 0x0F0F0F0F` holds `[w4..w7]` for `dot4I8Packed`.
+#[inline]
+fn interleave_w4_for_dp4a(word: u32) -> u32 {
+    let mut out = 0u32;
+    for b in 0..4u32 {
+        let lo = (word >> (b * 4)) & 0xF;
+        let hi = (word >> ((b + 4) * 4)) & 0xF;
+        out |= (lo | (hi << 4)) << (b * 8);
+    }
+    out
+}
+
 fn upload_w4(device: &wgpu::Device, label: &str, lin: &W4Linear) -> GpuW4Linear {
     let n_out = lin.out_features;
     let k_pack = lin.in_features / 8;
     let mut w_t = vec![0u32; k_pack * n_out];
     for n in 0..n_out {
         for kp in 0..k_pack {
-            w_t[kp * n_out + n] = lin.qweight_u32_signed[n * k_pack + kp];
+            w_t[kp * n_out + n] = interleave_w4_for_dp4a(lin.qweight_u32_signed[n * k_pack + kp]);
         }
     }
     let w_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -616,6 +634,7 @@ impl WgpuRunner {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
+            ..Default::default()
         }))
         .context("No compatible wgpu GPU adapter found")?;
 
@@ -626,19 +645,17 @@ impl WgpuRunner {
         limits.max_storage_buffer_binding_size = adapter.limits().max_storage_buffer_binding_size;
         limits.max_buffer_size = adapter.limits().max_buffer_size;
 
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("haruka-w4a8"),
-                required_features: wgpu::Features::empty(),
-                required_limits: limits,
-                memory_hints: wgpu::MemoryHints::Performance,
-            },
-            None,
-        ))
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("haruka-w4a8"),
+            required_features: wgpu::Features::empty(),
+            required_limits: limits,
+            memory_hints: wgpu::MemoryHints::Performance,
+            ..Default::default()
+        }))
         .context("Failed to create wgpu device")?;
 
         // Validate that WGSL dot4I8Packed compiles cleanly on this GPU driver
-        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let err_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let mk_pipe = |label: &str, wgsl: &str| -> wgpu::ComputePipeline {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some(label),
@@ -654,7 +671,8 @@ impl WgpuRunner {
             })
         };
 
-        let w4a8_pipe = mk_pipe("w4_universal", W4_UNIVERSAL_WGSL);
+        let quant_pipe = mk_pipe("quant_a8", QUANT_A8_WGSL);
+        let w4a8_pipe = mk_pipe("w4a8_dp4a", W4A8_DP4A_WGSL);
         let ln_pipe = mk_pipe("layernorm", LAYERNORM_WGSL);
         let rope_pipe = mk_pipe("rope", ROPE_WGSL);
         let attn_pipe = mk_pipe("attn", ATTN_WGSL);
@@ -662,7 +680,7 @@ impl WgpuRunner {
         let add_pipe = mk_pipe("add_res", ADD_RESIDUAL_WGSL);
         let patch_pipe = mk_pipe("patch_embed", PATCH_EMBED_WGSL);
 
-        if let Some(err) = pollster::block_on(device.pop_error_scope()) {
+        if let Some(err) = pollster::block_on(err_scope.pop()) {
             anyhow::bail!("wgpu shader validation failed (DP4A may not be supported on this GPU): {err}");
         }
 
@@ -705,6 +723,7 @@ impl WgpuRunner {
         let nchw_bytes = 3 * model.meta.img_size * model.meta.img_size * 4;
         let tok_bytes = seq_len * dim * 4;
         let mlp_bytes = seq_len * mlp_hidden * 4;
+        let max_k = mlp_hidden.max(model.head.in_features);
         let head_bytes = model.head.out_features * 4;
 
         let pp = PatchParams {
@@ -728,13 +747,23 @@ impl WgpuRunner {
         let elem_tok = ElemParams { len: (seq_len * dim) as u32, pad0: 0, pad1: 0, pad2: 0 };
         let elem_mlp = ElemParams { len: (seq_len * mlp_hidden) as u32, pad0: 0, pad1: 0, pad2: 0 };
 
+        let mk_quant_p = |m: usize, k: usize| QuantParams {
+            m: m as u32,
+            k_vec4: (k / 4) as u32,
+            num_act_groups: (k / 128) as u32,
+            pad0: 0,
+        };
+        let qp_dim = mk_quant_p(seq_len, dim);
+        let qp_mlp = mk_quant_p(seq_len, mlp_hidden);
+        let qp_head = mk_quant_p(1, model.head.in_features);
+
         let mk_gemm_p = |m: usize, lin: &crate::model::W4Linear| GemmParams {
             m: m as u32,
             n: lin.out_features as u32,
             k_pack: (lin.in_features / 8) as u32,
             num_w_groups: lin.num_groups as u32,
             has_bias: if lin.bias.is_some() { 1 } else { 0 },
-            pad0: 0,
+            num_act_groups: (lin.in_features / 128) as u32,
             pad1: 0,
             pad2: 0,
         };
@@ -766,6 +795,8 @@ impl WgpuRunner {
             fg_buf: mk_rw("fg", mlp_bytes),
             fx_buf: mk_rw("fx", mlp_bytes),
             delta_buf: mk_rw("delta", mlp_bytes),
+            x_q_buf: mk_rw("x_q", seq_len * max_k),
+            x_sc_buf: mk_rw("x_sc", seq_len * (max_k / 128 + 1) * 4),
             pool_in_buf: mk_rw("pool_in", model.head.in_features * 4),
             head_out_buf: mk_rw("head_out", head_bytes),
             readback_buf: device.create_buffer(&wgpu::BufferDescriptor {
@@ -781,6 +812,9 @@ impl WgpuRunner {
             u_ln_mlp: mk_uni_init("u_ln_mlp", bytemuck::bytes_of(&ln_mlp)),
             u_elem_tok: mk_uni_init("u_elem_tok", bytemuck::bytes_of(&elem_tok)),
             u_elem_mlp: mk_uni_init("u_elem_mlp", bytemuck::bytes_of(&elem_mlp)),
+            u_quant_dim: mk_uni_init("u_quant_dim", bytemuck::bytes_of(&qp_dim)),
+            u_quant_mlp: mk_uni_init("u_quant_mlp", bytemuck::bytes_of(&qp_mlp)),
+            u_quant_head: mk_uni_init("u_quant_head", bytemuck::bytes_of(&qp_head)),
             u_gemm_qkv: mk_uni_init("u_gemm_qkv", bytemuck::bytes_of(&gp_qkv)),
             u_gemm_k: mk_uni_init("u_gemm_k", bytemuck::bytes_of(&gp_k)),
             u_gemm_fc1: mk_uni_init("u_gemm_fc1", bytemuck::bytes_of(&gp_fc1)),
@@ -789,6 +823,7 @@ impl WgpuRunner {
 
             device,
             queue,
+            quant_pipe,
             w4a8_pipe,
             ln_pipe,
             rope_pipe,
@@ -831,15 +866,34 @@ impl WgpuRunner {
         x_buf: &wgpu::Buffer,
         lin: &GpuW4Linear,
         out_buf: &wgpu::Buffer,
+        u_quant: &wgpu::Buffer,
         u_gemm: &wgpu::Buffer,
         rows: usize,
     ) {
+        let q_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.quant_pipe.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: x_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: lin.awq_scale_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.x_q_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: self.x_sc_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: u_quant.as_entire_binding() },
+            ],
+        });
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.quant_pipe);
+            pass.set_bind_group(0, &q_bg, &[]);
+            pass.dispatch_workgroups(rows as u32, (lin.in_features / 128) as u32, 1);
+        }
+
         let g_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.w4a8_pipe.get_bind_group_layout(0),
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: x_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: lin.awq_scale_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: self.x_q_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.x_sc_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: lin.w_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: lin.w_scales_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: lin.bias_buf.as_entire_binding() },
@@ -864,9 +918,9 @@ impl WgpuRunner {
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
         rx.recv().unwrap().unwrap();
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().unwrap();
         let out: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
         drop(data);
         self.readback_buf.unmap();
@@ -955,9 +1009,9 @@ impl WgpuRunner {
 
         for blk in &self.blocks {
             self.encode_ln(&mut enc, &self.x_buf, &blk.norm1, &self.h_buf, &self.u_ln_dim, seq_len);
-            self.encode_w4a8(&mut enc, &self.h_buf, &blk.q_proj, &self.q_buf, &self.u_gemm_qkv, seq_len);
-            self.encode_w4a8(&mut enc, &self.h_buf, &blk.k_proj, &self.k_buf, &self.u_gemm_k, seq_len);
-            self.encode_w4a8(&mut enc, &self.h_buf, &blk.v_proj, &self.v_buf, &self.u_gemm_qkv, seq_len);
+            self.encode_w4a8(&mut enc, &self.h_buf, &blk.q_proj, &self.q_buf, &self.u_quant_dim, &self.u_gemm_qkv, seq_len);
+            self.encode_w4a8(&mut enc, &self.h_buf, &blk.k_proj, &self.k_buf, &self.u_quant_dim, &self.u_gemm_k, seq_len);
+            self.encode_w4a8(&mut enc, &self.h_buf, &blk.v_proj, &self.v_buf, &self.u_quant_dim, &self.u_gemm_qkv, seq_len);
 
             {
                 let mut pass = enc.begin_compute_pass(&Default::default());
@@ -972,7 +1026,7 @@ impl WgpuRunner {
                 pass.dispatch_workgroups(attn_q_wg, attn_h_wg, 1);
             }
 
-            self.encode_w4a8(&mut enc, &self.attn_out_buf, &blk.proj, &self.delta_buf, &self.u_gemm_qkv, seq_len);
+            self.encode_w4a8(&mut enc, &self.attn_out_buf, &blk.proj, &self.delta_buf, &self.u_quant_dim, &self.u_gemm_qkv, seq_len);
             {
                 let mut pass = enc.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&self.add_pipe);
@@ -982,8 +1036,8 @@ impl WgpuRunner {
 
             // SwiGLU MLP
             self.encode_ln(&mut enc, &self.x_buf, &blk.norm2, &self.h_buf, &self.u_ln_dim, seq_len);
-            self.encode_w4a8(&mut enc, &self.h_buf, &blk.fc1_g, &self.fg_buf, &self.u_gemm_fc1, seq_len);
-            self.encode_w4a8(&mut enc, &self.h_buf, &blk.fc1_x, &self.fx_buf, &self.u_gemm_fc1, seq_len);
+            self.encode_w4a8(&mut enc, &self.h_buf, &blk.fc1_g, &self.fg_buf, &self.u_quant_dim, &self.u_gemm_fc1, seq_len);
+            self.encode_w4a8(&mut enc, &self.h_buf, &blk.fc1_x, &self.fx_buf, &self.u_quant_dim, &self.u_gemm_fc1, seq_len);
             {
                 let mut pass = enc.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&self.swiglu_pipe);
@@ -991,7 +1045,7 @@ impl WgpuRunner {
                 pass.dispatch_workgroups(mlp_wg, 1, 1);
             }
             self.encode_ln(&mut enc, &self.delta_buf, &blk.mlp_norm, &self.fx_buf, &self.u_ln_mlp, seq_len);
-            self.encode_w4a8(&mut enc, &self.fx_buf, &blk.fc2, &self.delta_buf, &self.u_gemm_fc2, seq_len);
+            self.encode_w4a8(&mut enc, &self.fx_buf, &blk.fc2, &self.delta_buf, &self.u_quant_mlp, &self.u_gemm_fc2, seq_len);
             {
                 let mut pass = enc.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&self.add_pipe);
@@ -1009,10 +1063,10 @@ impl WgpuRunner {
         // 4. 2-Level 18-Query Tree Pool (tiny <0.5 ms on CPU)
         let pooled = forward_pool(&x_final, seq_len, &model.pool, dim);
 
-        // 5. 1152 -> 98,782 Classifier Head on GPU (W4A8)
+        // 5. 1152 -> 98,782 Classifier Head on GPU (W4A8 DP4A)
         self.queue.write_buffer(&self.pool_in_buf, 0, bytemuck::cast_slice(&pooled));
         let mut head_enc = self.device.create_command_encoder(&Default::default());
-        self.encode_w4a8(&mut head_enc, &self.pool_in_buf, &self.head, &self.head_out_buf, &self.u_gemm_head, 1);
+        self.encode_w4a8(&mut head_enc, &self.pool_in_buf, &self.head, &self.head_out_buf, &self.u_quant_head, &self.u_gemm_head, 1);
         head_enc.copy_buffer_to_buffer(
             &self.head_out_buf,
             0,
